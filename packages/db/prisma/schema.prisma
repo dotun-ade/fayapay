@@ -1,0 +1,662 @@
+// Fayapay platform schema.
+// One DB, one schema. We're aware of the multi-tenant trade-offs — see ADR-0002.
+//
+// Money: amounts are minor units (kobo, cents, pence). Always BigInt. Never Decimal.
+// Currency: ISO 4217 ("NGN", "USD", ...). Stored as String, never enum — we add new ones too often.
+//
+// Provider IDs are stored verbatim on the entity that owns the provider relationship.
+// Webhook events store the raw payload — we re-process on schema changes.
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions", "fullTextSearchPostgres"]
+}
+
+datasource db {
+  provider          = "postgresql"
+  url               = env("DATABASE_URL")
+  directUrl         = env("DIRECT_DATABASE_URL")
+  extensions        = [pgcrypto, citext, pg_trgm]
+}
+
+// ---------------------------------------------------------------------------
+// Identity
+// ---------------------------------------------------------------------------
+
+model Business {
+  id                String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  legalName         String
+  tradingName       String?
+  country           String              @db.Char(2)
+  taxId             String?
+  websiteUrl        String?
+  supportEmail      String?
+  status            BusinessStatus      @default(PENDING)
+  kybTier           Int                 @default(0)
+  riskRating        RiskRating          @default(MEDIUM)
+  metadata          Json                @default("{}")
+  createdAt         DateTime            @default(now())
+  updatedAt         DateTime            @updatedAt
+
+  users             User[]
+  cardholders       Cardholder[]
+  accounts          Account[]
+  apiKeys           ApiKey[]
+  kybRecord         KybRecord?
+
+  @@index([country, status])
+  @@map("businesses")
+}
+
+model User {
+  id                String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId        String      @db.Uuid
+  email             String      @db.Citext
+  phone             String?
+  firstName         String
+  lastName          String
+  role              UserRole    @default(MEMBER)
+  passwordHash      String
+  mfaSecret         String?
+  lastLoginAt       DateTime?
+  createdAt         DateTime    @default(now())
+  updatedAt         DateTime    @updatedAt
+
+  business          Business    @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  sessions          Session[]
+
+  @@unique([businessId, email])
+  @@index([email])
+  @@map("users")
+}
+
+model Session {
+  id            String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId        String   @db.Uuid
+  refreshToken  String   @unique
+  userAgent     String?
+  ip            String?
+  expiresAt     DateTime
+  revokedAt     DateTime?
+  createdAt     DateTime @default(now())
+
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("sessions")
+}
+
+model ApiKey {
+  id           String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId   String    @db.Uuid
+  name         String
+  keyPrefix    String    @unique
+  keyHash      String
+  scopes       String[]
+  lastUsedAt   DateTime?
+  revokedAt    DateTime?
+  createdAt    DateTime  @default(now())
+
+  business     Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@index([businessId])
+  @@map("api_keys")
+}
+
+// ---------------------------------------------------------------------------
+// Cardholders
+// A "cardholder" is the end user of our customer (the Business).
+// We do KYC on cardholders; KYB on businesses.
+// ---------------------------------------------------------------------------
+
+model Cardholder {
+  id              String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId      String           @db.Uuid
+  externalRef     String?
+  firstName       String
+  lastName        String
+  middleName      String?
+  email           String           @db.Citext
+  phone           String
+  dateOfBirth     DateTime         @db.Date
+  country         String           @db.Char(2)
+  addressLine1    String?
+  addressLine2    String?
+  city            String?
+  region          String?
+  postalCode      String?
+  kycStatus       KycStatus        @default(PENDING)
+  kycTier         Int              @default(0)
+  status          CardholderStatus @default(ACTIVE)
+  metadata        Json             @default("{}")
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+
+  business        Business         @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  cards           Card[]
+  accounts        Account[]
+  kycRecords      KycRecord[]
+
+  @@unique([businessId, externalRef])
+  @@index([businessId, kycStatus])
+  @@index([email])
+  @@map("cardholders")
+}
+
+// ---------------------------------------------------------------------------
+// Accounts & ledger
+// Account is the customer-facing balance bucket. The ledger is double-entry
+// and lives in ledger_entries — Account.availableBalance is a denormalised
+// view recomputed by a trigger. Never trust it for postings; query the ledger.
+// ---------------------------------------------------------------------------
+
+model Account {
+  id                  String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId          String         @db.Uuid
+  cardholderId        String?        @db.Uuid
+  type                AccountType
+  currency            String         @db.Char(3)
+  availableBalance    BigInt         @default(0)
+  pendingBalance      BigInt         @default(0)
+  reservedBalance     BigInt         @default(0)
+  externalAccountNumber String?
+  externalSortCode    String?
+  externalIban        String?
+  externalProvider    String?
+  externalRef         String?
+  status              AccountStatus  @default(ACTIVE)
+  metadata            Json           @default("{}")
+  createdAt           DateTime       @default(now())
+  updatedAt           DateTime       @updatedAt
+
+  business            Business       @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  cardholder          Cardholder?    @relation(fields: [cardholderId], references: [id])
+  cards               Card[]
+  ledgerEntries       LedgerEntry[]
+  transfersFrom       Transfer[]     @relation("transfersFrom")
+  transfersTo         Transfer[]     @relation("transfersTo")
+  payouts             Payout[]
+  collections         Collection[]
+
+  @@index([businessId, currency])
+  @@index([cardholderId])
+  @@index([externalProvider, externalRef])
+  @@map("accounts")
+}
+
+model LedgerEntry {
+  id              String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  accountId       String       @db.Uuid
+  txGroupId       String       @db.Uuid
+  direction       LedgerDir
+  amount          BigInt
+  currency        String       @db.Char(3)
+  type            LedgerType
+  description     String?
+  referenceType   String?
+  referenceId     String?
+  postedAt        DateTime     @default(now())
+  metadata        Json         @default("{}")
+
+  account         Account      @relation(fields: [accountId], references: [id])
+
+  @@index([accountId, postedAt])
+  @@index([txGroupId])
+  @@index([referenceType, referenceId])
+  @@map("ledger_entries")
+}
+
+// ---------------------------------------------------------------------------
+// Cards
+// ---------------------------------------------------------------------------
+
+model Card {
+  id                  String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId          String         @db.Uuid
+  cardholderId        String         @db.Uuid
+  accountId           String         @db.Uuid
+  provider            CardProvider
+  providerCardId      String?
+  providerCardHolderId String?
+  brand               CardBrand
+  type                CardType
+  currency            String         @db.Char(3)
+  last4               String?
+  expMonth            Int?
+  expYear             Int?
+  nameOnCard          String
+  status              CardStatus     @default(PENDING)
+  frozenAt            DateTime?
+  shippingAddress     Json?
+  spendingControls    Json?
+  metadata            Json           @default("{}")
+  createdAt           DateTime       @default(now())
+  updatedAt           DateTime       @updatedAt
+  activatedAt         DateTime?
+  cancelledAt         DateTime?
+
+  business            Business       @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  cardholder          Cardholder     @relation(fields: [cardholderId], references: [id])
+  account             Account        @relation(fields: [accountId], references: [id])
+  authorizations      CardAuthorization[]
+  transactions        CardTransaction[]
+
+  @@unique([provider, providerCardId])
+  @@index([businessId, status])
+  @@index([cardholderId])
+  @@map("cards")
+}
+
+model CardAuthorization {
+  id              String                 @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  cardId          String                 @db.Uuid
+  providerAuthId  String
+  amount          BigInt
+  currency        String                 @db.Char(3)
+  merchantName    String?
+  merchantCity    String?
+  merchantCountry String?
+  mcc             String?
+  decision        AuthDecision
+  declineReason   String?
+  raw             Json
+  receivedAt      DateTime               @default(now())
+
+  card            Card                   @relation(fields: [cardId], references: [id])
+
+  @@unique([cardId, providerAuthId])
+  @@index([receivedAt])
+  @@map("card_authorizations")
+}
+
+model CardTransaction {
+  id                  String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  cardId              String         @db.Uuid
+  providerTxId        String
+  authorizationId     String?        @db.Uuid
+  amount              BigInt
+  currency            String         @db.Char(3)
+  fxAmount            BigInt?
+  fxCurrency          String?        @db.Char(3)
+  fxRate              Decimal?       @db.Decimal(18, 8)
+  merchantName        String?
+  mcc                 String?
+  type                CardTxType
+  status              CardTxStatus
+  postedAt            DateTime
+  raw                 Json
+  createdAt           DateTime       @default(now())
+
+  card                Card           @relation(fields: [cardId], references: [id])
+
+  @@unique([cardId, providerTxId])
+  @@index([cardId, postedAt])
+  @@map("card_transactions")
+}
+
+// ---------------------------------------------------------------------------
+// Money movement
+// ---------------------------------------------------------------------------
+
+model Transfer {
+  id                String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId        String           @db.Uuid
+  sourceAccountId   String           @db.Uuid
+  destAccountId     String           @db.Uuid
+  amount            BigInt
+  currency          String           @db.Char(3)
+  status            TransferStatus   @default(PENDING)
+  idempotencyKey    String           @unique
+  reference         String?
+  failureReason     String?
+  createdAt         DateTime         @default(now())
+  completedAt       DateTime?
+
+  sourceAccount     Account          @relation("transfersFrom", fields: [sourceAccountId], references: [id])
+  destAccount       Account          @relation("transfersTo", fields: [destAccountId], references: [id])
+
+  @@index([businessId, status])
+  @@map("transfers")
+}
+
+model Payout {
+  id                  String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  accountId           String         @db.Uuid
+  provider            PayoutProvider
+  providerPayoutId    String?
+  amount              BigInt
+  currency            String         @db.Char(3)
+  beneficiaryName     String
+  beneficiaryAccount  String
+  beneficiaryBankCode String?
+  beneficiaryIban     String?
+  beneficiarySwift    String?
+  reference           String?
+  status              PayoutStatus   @default(PENDING)
+  failureReason       String?
+  idempotencyKey      String         @unique
+  attempts            Int            @default(0)
+  metadata            Json           @default("{}")
+  createdAt           DateTime       @default(now())
+  completedAt         DateTime?
+
+  account             Account        @relation(fields: [accountId], references: [id])
+
+  @@unique([provider, providerPayoutId])
+  @@index([status, createdAt])
+  @@map("payouts")
+}
+
+model Collection {
+  id                  String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  accountId           String              @db.Uuid
+  provider            CollectionProvider
+  providerRef         String?
+  amount              BigInt
+  currency            String              @db.Char(3)
+  payerName           String?
+  payerEmail          String?
+  payerAccount        String?
+  method              String?
+  status              CollectionStatus    @default(PENDING)
+  raw                 Json?
+  createdAt           DateTime            @default(now())
+  receivedAt          DateTime?
+
+  account             Account             @relation(fields: [accountId], references: [id])
+
+  @@unique([provider, providerRef])
+  @@index([status])
+  @@map("collections")
+}
+
+model FxQuote {
+  id              String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  provider        String
+  pair            String
+  side            FxSide
+  rate            Decimal      @db.Decimal(18, 8)
+  fromAmount      BigInt
+  toAmount        BigInt
+  spreadBps       Int
+  expiresAt       DateTime
+  providerQuoteId String?
+  createdAt       DateTime     @default(now())
+  consumedAt      DateTime?
+  consumedByTxId  String?      @db.Uuid
+
+  @@index([pair, createdAt])
+  @@map("fx_quotes")
+}
+
+// ---------------------------------------------------------------------------
+// Compliance
+// ---------------------------------------------------------------------------
+
+model KybRecord {
+  id              String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId      String       @unique @db.Uuid
+  provider        String
+  providerRef     String?
+  status          KycStatus    @default(PENDING)
+  riskScore       Int?
+  rejectionReason String?
+  raw             Json?
+  reviewedAt      DateTime?
+  reviewedBy      String?
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+
+  business        Business     @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@map("kyb_records")
+}
+
+model KycRecord {
+  id              String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  cardholderId    String       @db.Uuid
+  provider        String
+  providerRef     String?
+  type            KycType
+  status          KycStatus    @default(PENDING)
+  riskScore       Int?
+  rejectionReason String?
+  raw             Json?
+  attempts        Int          @default(0)
+  reviewedAt      DateTime?
+  reviewedBy      String?
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+
+  cardholder      Cardholder   @relation(fields: [cardholderId], references: [id], onDelete: Cascade)
+
+  @@index([cardholderId, status])
+  @@index([provider, providerRef])
+  @@map("kyc_records")
+}
+
+// ---------------------------------------------------------------------------
+// Webhooks & integrations
+// ---------------------------------------------------------------------------
+
+model WebhookEvent {
+  id              String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  provider        String
+  eventType       String
+  providerEventId String
+  signatureValid  Boolean
+  receivedAt      DateTime       @default(now())
+  processedAt     DateTime?
+  attempts        Int            @default(0)
+  lastError       String?
+  payload         Json
+  headers         Json
+
+  @@unique([provider, providerEventId])
+  @@index([provider, processedAt])
+  @@index([receivedAt])
+  @@map("webhook_events")
+}
+
+model ProviderCredential {
+  id              String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  provider        String     @unique
+  baseUrl         String
+  status          String     @default("active")
+  lastHealthcheck DateTime?
+  metadata        Json       @default("{}")
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+
+  @@map("provider_credentials")
+}
+
+model AuditLog {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  actorType   String
+  actorId     String?
+  action      String
+  targetType  String
+  targetId    String?
+  metadata    Json     @default("{}")
+  ip          String?
+  userAgent   String?
+  createdAt   DateTime @default(now())
+
+  @@index([actorType, actorId])
+  @@index([targetType, targetId])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum BusinessStatus {
+  PENDING
+  ACTIVE
+  SUSPENDED
+  CLOSED
+}
+
+enum UserRole {
+  OWNER
+  ADMIN
+  MEMBER
+  VIEWER
+}
+
+enum CardholderStatus {
+  ACTIVE
+  FROZEN
+  BLOCKED
+  CLOSED
+}
+
+enum KycStatus {
+  PENDING
+  IN_REVIEW
+  APPROVED
+  REJECTED
+  EXPIRED
+}
+
+enum KycType {
+  IDENTITY
+  ADDRESS
+  BIOMETRIC
+  BVN
+  NIN
+  CAC
+  PASSPORT
+  DRIVERS_LICENSE
+}
+
+enum RiskRating {
+  LOW
+  MEDIUM
+  HIGH
+  PROHIBITED
+}
+
+enum AccountType {
+  WALLET
+  COLLECTION
+  SETTLEMENT
+  CARD_FUNDING
+  FX_BUFFER
+  FEE
+}
+
+enum AccountStatus {
+  ACTIVE
+  FROZEN
+  CLOSED
+}
+
+enum LedgerDir {
+  DEBIT
+  CREDIT
+}
+
+enum LedgerType {
+  CARD_AUTH
+  CARD_AUTH_REVERSAL
+  CARD_CAPTURE
+  CARD_REFUND
+  TRANSFER
+  PAYOUT
+  COLLECTION
+  FX_CONVERSION
+  FEE
+  ADJUSTMENT
+  CHARGEBACK
+  WRITE_OFF
+}
+
+enum CardProvider {
+  SUDO
+}
+
+enum CardBrand {
+  VISA
+  MASTERCARD
+  VERVE
+}
+
+enum CardType {
+  VIRTUAL
+  PHYSICAL
+}
+
+enum CardStatus {
+  PENDING
+  ACTIVE
+  FROZEN
+  CANCELLED
+  EXPIRED
+}
+
+enum AuthDecision {
+  APPROVED
+  DECLINED
+}
+
+enum CardTxType {
+  AUTHORIZATION
+  CAPTURE
+  REFUND
+  REVERSAL
+  FEE
+  ADJUSTMENT
+}
+
+enum CardTxStatus {
+  PENDING
+  POSTED
+  REVERSED
+  DISPUTED
+}
+
+enum TransferStatus {
+  PENDING
+  COMPLETED
+  FAILED
+  REVERSED
+}
+
+enum PayoutProvider {
+  PAYSTACK
+  FLUTTERWAVE
+  WISE
+  CURRENCYCLOUD
+  MODULR
+}
+
+enum PayoutStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+  RETURNED
+}
+
+enum CollectionProvider {
+  PAYSTACK
+  FLUTTERWAVE
+  WISE
+  CURRENCYCLOUD
+  MODULR
+}
+
+enum CollectionStatus {
+  PENDING
+  COMPLETED
+  FAILED
+}
+
+enum FxSide {
+  BUY
+  SELL
+}

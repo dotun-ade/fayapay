@@ -1,0 +1,43 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: fayapay-postgres
+    environment:
+      POSTGRES_USER: fayapay
+      POSTGRES_PASSWORD: fayapay
+      POSTGRES_DB: fayapay
+    ports:
+      - "5432:5432"
+    volumes:
+      - fayapay_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fayapay"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: fayapay-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - fayapay_redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  mailhog:
+    image: mailhog/mailhog:latest
+    container_name: fayapay-mailhog
+    ports:
+      - "1025:1025"
+      - "8025:8025"
+
+volumes:
+  fayapay_pg:
+  fayapay_redis:

@@ -1,0 +1,23 @@
+# Default
+*                                @fayapay/platform
+
+# Ledger and money movement — payments team gates all changes
+packages/ledger/                  @fayapay/payments
+apps/api/src/routes/transfers.ts  @fayapay/payments
+apps/api/src/routes/payouts.ts    @fayapay/payments
+apps/api/src/services/payout-router.ts @fayapay/payments
+apps/worker/src/consumers/payouts.ts @fayapay/payments
+apps/worker/src/consumers/recon.ts @fayapay/payments
+
+# Card issuing
+packages/integrations/sudo/       @fayapay/issuing
+
+# KYC + compliance
+packages/integrations/dojah/      @fayapay/compliance
+apps/api/src/services/kyc-router.ts @fayapay/compliance
+
+# Schema changes require platform + payments
+packages/db/prisma/schema.prisma  @fayapay/platform @fayapay/payments
+
+# Architecture decisions
+docs/adr/                         @fayapay/platform-leads
